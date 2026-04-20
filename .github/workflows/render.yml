@@ -1,1 +1,114 @@
+name: Render Shorts Video
 
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Unique run ID from n8n'
+        required: true
+        type: string
+      audio_url:
+        description: 'Public URL of audio file (from file.io)'
+        required: true
+        type: string
+      duration:
+        description: 'Estimated duration in seconds'
+        required: true
+        type: string
+      srt_content:
+        description: 'SRT subtitle content (JSON-encoded string)'
+        required: true
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg imagemagick
+          pip install requests pillow
+
+      - name: Download audio
+        run: |
+          mkdir -p workspace
+          curl -L "${{ github.event.inputs.audio_url }}" -o workspace/audio.mp3
+          echo "Audio downloaded: $(du -h workspace/audio.mp3 | cut -f1)"
+
+      - name: Write SRT file
+        run: |
+          python3 -c "
+          import json, sys
+          srt = json.loads(sys.argv[1])
+          with open('workspace/subs.srt', 'w') as f:
+              f.write(srt)
+          print('SRT written:', len(srt), 'chars')
+          " '${{ github.event.inputs.srt_content }}'
+
+      - name: Generate background frame
+        run: |
+          python3 << 'EOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import colorsys
+
+          W, H = 1080, 1920  # Shorts: 9:16
+          img = Image.new('RGB', (W, H), (0, 0, 0))
+          draw = ImageDraw.Draw(img)
+
+          # Violet radial gradient effect
+          for r in range(min(W, H) // 2, 0, -10):
+              alpha = int(40 * (1 - r / (min(W, H) / 2)))
+              draw.ellipse(
+                  [W//2 - r, H//2 - r, W//2 + r, H//2 + r],
+                  outline=(124, 58, 237),
+                  width=1
+              )
+
+          # Accent bars
+          draw.rectangle([0, 0, W, 8], fill=(124, 58, 237))
+          draw.rectangle([0, H-8, W, H], fill=(124, 58, 237))
+
+          # NeuroStripped watermark at top
+          try:
+              font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
+          except:
+              font = ImageFont.load_default()
+          draw.text((W//2, 80), "NEUROSTRIPPED", font=font, fill=(124, 58, 237), anchor="mm")
+
+          img.save('workspace/bg.png')
+          print("Background frame generated.")
+          EOF
+
+      - name: Render video with FFmpeg (Shorts 9:16)
+        run: |
+          DURATION="${{ github.event.inputs.duration }}"
+          ffmpeg -y \
+            -loop 1 -i workspace/bg.png \
+            -i workspace/audio.mp3 \
+            -vf "subtitles=workspace/subs.srt:force_style='Fontname=Arial Black,FontSize=20,PrimaryColour=&Hffffff,OutlineColour=&H000000,Outline=3,Bold=1,Alignment=2,MarginV=80'" \
+            -c:v libx264 -preset fast -crf 20 \
+            -c:a aac -b:a 192k \
+            -pix_fmt yuv420p \
+            -t "$DURATION" \
+            -shortest \
+            -movflags +faststart \
+            "workspace/video_${{ github.event.inputs.run_id }}.mp4"
+          echo "Render complete: $(du -h workspace/video_*.mp4 | cut -f1)"
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.event.inputs.run_id }}
+          path: workspace/video_*.mp4
+          retention-days: 1
